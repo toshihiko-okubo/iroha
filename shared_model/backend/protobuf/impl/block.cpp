@@ -94,16 +94,6 @@ namespace shared_model {
     bool Block::addSignature(
         interface::types::SignedHexStringView signed_blob,
         interface::types::PublicKeyHexStringView public_key) {
-      // if already has such signature
-      if (std::find_if(impl_->signatures_.begin(),
-                       impl_->signatures_.end(),
-                       [&public_key](const auto &signature) {
-                         return signature.publicKey() == public_key;
-                       })
-          != impl_->signatures_.end()) {
-        return false;
-      }
-
       auto sig = impl_->proto_.add_signatures();
       std::string_view const &signed_string{signed_blob};
       sig->set_signature(signed_string.data(), signed_string.size());

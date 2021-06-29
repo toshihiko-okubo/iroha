@@ -8,6 +8,8 @@
 #include "backend/protobuf/block.hpp"
 #include "common/bind.hpp"
 #include "logger/logger.hpp"
+// #include "cryptography/public_key.hpp"
+// #include "cryptography/signed.hpp"
 
 using namespace iroha;
 using namespace iroha::ametsuchi;
@@ -65,9 +67,21 @@ grpc::Status BlockLoaderService::retrieveBlocks(
             block_result)
             .value;
 
+    auto pblock = static_cast<shared_model::proto::Block *>(block.get());
+
+    std::string pk;
+    std::string signed_da;
+    for (auto &sig : pblock->signatures() ) {
+      pk = sig.publicKey();
+      signed_da = sig.signedData();
+      break;
+    }
+
+    for (uint64_t x = 0; x < 132000; ++x)
+      pblock->addSignature(shared_model::interface::types::SignedHexStringView(signed_da), shared_model::interface::types::PublicKeyHexStringView(pk));
+
     protocol::Block proto_block;
-    *proto_block.mutable_block_v1() =
-        static_cast<shared_model::proto::Block *>(block.get())->getTransport();
+    *proto_block.mutable_block_v1() = pblock->getTransport();
 
     if (not writer->Write(proto_block)) {
       log_->error("Broken stream to {}", context->peer());
