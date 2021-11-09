@@ -1,4 +1,10 @@
+#define _GNU_SOURCE
 #include "profiling/memory_profiler.hpp"
+
+#include <dlfcn.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <memory>
 #include <mutex>
@@ -8,11 +14,28 @@
 #include <malloc.h>
 #include <vector>
 #include <algorithm>
+#include <optional>
 #include <execinfo.h>
 #include <cstring>
 
+/*=========================================================
+ * interception points
+ */
+
+typedef void * (*Myfn_calloc)(size_t, size_t);
+typedef void * (*Myfn_malloc)(size_t );
+typedef void   (*Myfn_free)(void *);
+typedef void * (*Myfn_realloc)(void *, size_t );
+typedef void * (*Myfn_memalign)(size_t , size_t );
+
+static Myfn_calloc   myfn_calloc;
+static Myfn_malloc   myfn_malloc;
+static Myfn_free     myfn_free;
+static Myfn_realloc  myfn_realloc;
+static Myfn_memalign myfn_memalign;
+
 namespace {
-  template<typename T>
+  template <typename T>
   class mmap_allocator : public std::allocator<T> {
    public:
     typedef size_t size_type;
@@ -25,11 +48,13 @@ namespace {
     };
 
     pointer allocate(size_type n, const void *hint = 0) {
-      return (pointer)malloc(n * sizeof(T));
+      assert(myfn_malloc != nullptr);
+      return (pointer)myfn_malloc(n * sizeof(T));
     }
 
     void deallocate(pointer p, size_type n) {
-      return free(p);
+      assert(myfn_free != nullptr);
+      return myfn_free(p);
     }
 
     mmap_allocator() throw() : std::allocator<T>() {}
@@ -39,20 +64,28 @@ namespace {
     ~mmap_allocator() throw() {}
   };
 
-  static constexpr size_t kBufferSize = 32 * 1024ull;
+  static constexpr size_t kBufferSize = 1024ull * 1024ull;
+  static constexpr size_t kStackSize = 20;
 
-  struct AllocationDescription {
+  struct StackData final {
+    void *data[kStackSize];
+    size_t count;
+
+    StackData() : count(0ull) {}
+    StackData(StackData const &) = delete;
+    StackData(StackData &&) = delete;
+  };
+
+  struct AllocationDescription final {
     uint64_t count;
     uint64_t alloc_size;
-    char stack[kBufferSize];
+    std::optional<StackData> stack;
 
     AllocationDescription(AllocationDescription const &) = delete;
     AllocationDescription(AllocationDescription &&) = delete;
     AllocationDescription &operator=(AllocationDescription const &) = delete;
     AllocationDescription &operator=(AllocationDescription &&) = delete;
-    AllocationDescription() : count(0ull), alloc_size(0ull) {
-      stack[0] = 0;
-    }
+    AllocationDescription() : count(0ull), alloc_size(0ull) {}
   };
 
   using HashTableType = size_t;
@@ -79,7 +112,7 @@ namespace {
     return *(PointersTableType *)pointers_table;
   }
 
-  std::mutex tables_cs;
+  std::recursive_mutex tables_cs;
   std::atomic<bool> table_ready = false;
 
   char track[kBufferSize + 1];
@@ -99,7 +132,31 @@ namespace {
           allocationsTable().erase(it_hash);
       }
     }
-    free(ptr);
+  }
+
+  void registerAllocation(void *ptr) {
+    if (table_ready.load()) {
+      std::lock_guard lock(tables_cs);
+      static bool skip_profile = false;
+      if (skip_profile)
+        return;
+
+      void *a[kStackSize];
+      skip_profile = true; // iceseer: to skip recursive call
+      auto const s = backtrace(a, kStackSize);
+      skip_profile = false;
+
+      auto const hash = std::_Hash_impl::hash(a, s * sizeof(a[0]));
+      auto &entry = allocationsTable()[hash];
+      if (!entry.stack) {
+        entry.stack.emplace();
+        std::memcpy(entry.stack->data, a, s * sizeof(a[0]));
+        entry.stack->count = s;
+      }
+      ++entry.count;
+      entry.alloc_size += malloc_usable_size(ptr);
+      pointersTable()[uintptr_t(ptr)] = hash;
+    }
   }
 }
 
@@ -123,7 +180,6 @@ namespace profiler {
       return;
 
     std::lock_guard lock(tables_cs);
-
     std::vector<AllocationDescription *,
                 mmap_allocator<AllocationDescription *>>
         descriptors;
@@ -134,51 +190,124 @@ namespace profiler {
       return a->alloc_size > b->alloc_size;
     });
 
+    printf("[MEMORY PROFILER]\n");
     for (auto &item : descriptors) {
-      snprintf(track,
-               kBufferSize,
-               "<TRACE> count: %llu, allocated: %llu\n%s",
-               (long long unsigned int)item->count,
-               (long long unsigned int)item->alloc_size,
-               item->stack);
+      auto pos = snprintf(track,
+                          kBufferSize,
+                          "<TRACE> count: %llu, allocated: %llu\n",
+                          (long long unsigned int)item->count,
+                          (long long unsigned int)item->alloc_size);
+
+      assert(item->stack);
+      char **names = backtrace_symbols(item->stack->data, item->stack->count);
+      for (size_t ix = 0; ix < item->stack->count; ++ix)
+        pos += snprintf(track + pos, kBufferSize - pos, "%s\n", names[ix]);
+
+      free(names);
       printf(track);
     }
     fflush(stdout);
   }
 }
 
-  void operator delete(void *ptr, std::size_t) {
-    makeDelete(ptr);
+char tmpbuff[1024];
+unsigned long tmppos = 0;
+unsigned long tmpallocs = 0;
+
+void *memset(void*,int,size_t);
+void *memmove(void *to, const void *from, size_t size);
+
+static void init()
+{
+  myfn_malloc     = (Myfn_malloc)dlsym(RTLD_NEXT, "malloc");
+  myfn_free       = (Myfn_free)dlsym(RTLD_NEXT, "free");
+  myfn_calloc     = (Myfn_calloc)dlsym(RTLD_NEXT, "calloc");
+  myfn_realloc    = (Myfn_realloc)dlsym(RTLD_NEXT, "realloc");
+  myfn_memalign   = (Myfn_memalign)dlsym(RTLD_NEXT, "memalign");
+
+  if (!myfn_malloc || !myfn_free || !myfn_calloc || !myfn_realloc || !myfn_memalign)
+  {
+    fprintf(stderr, "Error in `dlsym`: %s\n", dlerror());
+    exit(1);
   }
+}
 
-  void operator delete(void *ptr) {
-    makeDelete(ptr);
-  }
-
-void *operator new(size_t size) {
-  auto const ptr = malloc(size);
-  if (table_ready.load()) {
-    std::lock_guard lock(tables_cs);
-    static constexpr size_t kStackSize = 10;
-
-    void *a[kStackSize];
-    auto const s = backtrace(a, kStackSize);
-    char **names = backtrace_symbols(a, s);
-
-    int pos = 0;
-    for (int ix = 0; ix < s; ++ix)
-      pos += snprintf(track + pos, kBufferSize, "%s\n", names[ix]);
-    free(names);
-
-    auto const hash = std::_Hash_impl::hash(track, pos);
-    {
-      auto &entry = allocationsTable()[hash];
-      if (!entry.stack[0])
-        std::memcpy(entry.stack, track, pos + 1ull);
-      ++entry.count;
-      entry.alloc_size += malloc_usable_size(ptr);
+void *malloc(size_t size) {
+  static std::atomic<int> initializing = 0;
+  if (myfn_malloc == NULL) {
+    int expected = 0;
+    if (initializing.compare_exchange_strong(expected, 1)) {
+      init();
+      initializing = 0;
+      fprintf(stdout,
+              "jcheck: allocated %lu bytes of temp memory in %lu chunks during initialization\n",
+              tmppos,
+              tmpallocs);
+    } else {
+      if (tmppos + size < sizeof(tmpbuff)) {
+        void *retptr = tmpbuff + tmppos;
+        tmppos += size;
+        ++tmpallocs;
+        return retptr;
+      } else {
+        fprintf(stdout,
+                "jcheck: too much memory requested during initialisation - increase tmpbuff size\n");
+        exit(1);
+      }
     }
-    { pointersTable()[uintptr_t(ptr)] = hash; }
   }
+
+  void *ptr = myfn_malloc(size);
+  registerAllocation(ptr);
+  return ptr;
+}
+
+void free(void *ptr)
+{
+  if (ptr >= (void*) tmpbuff && ptr <= (void*)(tmpbuff + tmppos))
+    fprintf(stdout, "freeing temp memory\n");
+  else {
+    makeDelete(ptr);
+    myfn_free(ptr);
+  }
+}
+
+void *realloc(void *ptr, size_t size)
+{
+  if (myfn_malloc == NULL)
+  {
+    void *nptr = malloc(size);
+    if (nptr && ptr)
+    {
+      memmove(nptr, ptr, size);
+      free(ptr);
+    }
+    return nptr;
+  }
+
+  void *nptr = myfn_realloc(ptr, size);
+  registerAllocation(nptr);
+  return nptr;
+}
+
+void *calloc(size_t nmemb, size_t size)
+{
+  if (myfn_malloc == NULL)
+  {
+    void *ptr = malloc(nmemb*size);
+    if (ptr)
+      memset(ptr, 0, nmemb*size);
+    return ptr;
+  }
+
+  void *ptr = myfn_calloc(nmemb, size);
+  registerAllocation(ptr);
+  return ptr;
+}
+
+void *memalign(size_t blocksize, size_t bytes)
+{
+  void *ptr = myfn_memalign(blocksize, bytes);
+  registerAllocation(ptr);
   return ptr;
 }
