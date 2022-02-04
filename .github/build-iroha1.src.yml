@@ -52,6 +52,7 @@ on:
   pull_request:
     branches: [ main, support/1.*, edge, develop ]  ## target branches
   workflow_dispatch:
+    branches: [ main, support/1.*, edge, develop, test-ci, gha, gha/*, gha-*, \*-with-gha, feature/manual-image-build ]
     ## NOTE: Able to run via cmdline: gh workflow run Iroha1
     inputs:
       build_spec:
