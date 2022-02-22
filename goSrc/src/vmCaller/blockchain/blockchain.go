@@ -4,8 +4,11 @@ import (
 	"encoding/binary"
 	"time"
 
+	"github.com/hyperledger/burrow/execution/engine"
 	"github.com/hyperledger/burrow/execution/errors"
 )
+
+var _ engine.Blockchain = (*Blockchain)(nil)
 
 type Blockchain struct {
 	blockHeight uint64
@@ -31,4 +34,8 @@ func (b *Blockchain) BlockHash(height uint64) ([]byte, error) {
 	bs := make([]byte, 32)
 	binary.BigEndian.PutUint64(bs[24:], height)
 	return bs, nil
+}
+
+func (b *Blockchain) ChainID() string {
+	return ""
 }

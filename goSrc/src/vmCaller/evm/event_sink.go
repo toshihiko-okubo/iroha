@@ -31,3 +31,7 @@ func (ies *IrohaEventSink) Log(log *exec.LogEvent) error {
 	err := ies.irohaState.StoreTxReceipt(log.Address, log.Data, log.Topics)
 	return err
 }
+
+func (ies *IrohaEventSink) Print(print *exec.PrintEvent) error {
+	return nil
+}

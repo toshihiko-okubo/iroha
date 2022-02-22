@@ -4,11 +4,13 @@ package main
 import "C"
 import (
 	"fmt"
+	"math/big"
 	"unsafe"
 
 	"vmCaller/blockchain"
-	vm "vmCaller/evm"
 	"vmCaller/iroha"
+
+	vm "vmCaller/evm"
 
 	"github.com/hyperledger/burrow/acm"
 	"github.com/hyperledger/burrow/acm/acmstate"
@@ -16,14 +18,13 @@ import (
 	"github.com/hyperledger/burrow/execution/engine"
 	"github.com/hyperledger/burrow/execution/evm"
 	"github.com/hyperledger/burrow/execution/exec"
-	"github.com/hyperledger/burrow/execution/native"
 	"github.com/hyperledger/burrow/permission"
 	"github.com/tmthrgd/go-hex"
 )
 
 var (
 	// Create EVM instance
-	burrowEVM = evm.New(evm.Options{
+	burrowEVM = evm.New(engine.Options{
 		Natives: vm.MustCreateNatives(),
 	})
 )
@@ -57,7 +58,7 @@ func VmCall(input, caller, callee, nonce *C.const_char, commandExecutor, queryEx
 	}
 
 	// Convert the caller Iroha Account ID to an EVM addresses
-	evmCaller := native.AddressFromName(C.GoString(caller))
+	evmCaller := engine.AddressFromName(C.GoString(caller))
 	callerAccount, err := worldState.GetAccount(evmCaller)
 	if err != nil {
 		return makeError(fmt.Sprintf("Error getting account at address %s: %s",
@@ -113,7 +114,8 @@ func VmCall(input, caller, callee, nonce *C.const_char, commandExecutor, queryEx
 
 func (w *EngineWrapper) NewContract(caller crypto.Address, code []byte, nonce string) (string, error) {
 	var output acm.Bytecode
-	var gas uint64 = 1000000
+	var value = big.NewInt(0)
+	var gas = big.NewInt(1000000)
 
 	callee := addressFromNonce(nonce)
 
@@ -138,8 +140,8 @@ func (w *EngineWrapper) NewContract(caller crypto.Address, code []byte, nonce st
 		Caller: caller,
 		Callee: callee,
 		Input:  []byte{},
-		Value:  0,
-		Gas:    &gas,
+		Value:  *value,
+		Gas:    gas,
 	}
 	output, err = w.engine.Execute(w.state, blockchain.New(), w.eventSink, params, code)
 	if err != nil {
@@ -147,7 +149,7 @@ func (w *EngineWrapper) NewContract(caller crypto.Address, code []byte, nonce st
 			callee.String(), err.Error())
 	}
 
-	if err := native.InitCode(w.state, callee, output); err != nil {
+	if err := engine.InitEVMCode(w.state, callee, output); err != nil {
 		return "", fmt.Errorf("Error initializing contract code at address %s: %s",
 			callee.String(), err.Error())
 	}
@@ -156,7 +158,8 @@ func (w *EngineWrapper) NewContract(caller crypto.Address, code []byte, nonce st
 }
 
 func (w *EngineWrapper) Execute(caller, callee crypto.Address, input []byte) ([]byte, error) {
-	var gas uint64 = 1000000
+	var value = big.NewInt(0)
+	var gas = big.NewInt(1000000)
 
 	calleeAccount, err := w.state.GetAccount(callee)
 	if err != nil {
@@ -171,8 +174,8 @@ func (w *EngineWrapper) Execute(caller, callee crypto.Address, input []byte) ([]
 		Caller: caller,
 		Callee: callee,
 		Input:  input,
-		Value:  0,
-		Gas:    &gas,
+		Value:  *value,
+		Gas:    gas,
 	}
 	output, err := w.engine.Execute(w.state, blockchain.New(), w.eventSink, params, calleeAccount.EVMCode)
 
